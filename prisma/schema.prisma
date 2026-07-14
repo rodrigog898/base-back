@@ -1,0 +1,60 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+model User {
+  id                  String    @id @default(auto()) @map("_id") @db.ObjectId
+  email               String    @unique
+  passwordHash        String
+  role                Role      @default(USER)
+  isActive            Boolean   @default(true)
+  isBlocked           Boolean   @default(false)
+  failedLoginAttempts Int       @default(0)
+  loginBlockedUntil   DateTime?
+  bannedUntil         DateTime? @map("banned_until")
+  lastConnectionAt    DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+}
+
+model Session {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId       String   @db.ObjectId
+  refreshToken String   @unique
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+}
+
+model AuthSecurityLog {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  email       String
+  event       String
+  description String
+  userId      String?  @db.ObjectId
+  ip          String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  @@map("auth_security_log")
+}
+
+model AuthIpThrottle {
+  id             String    @id @default(auto()) @map("_id") @db.ObjectId
+  ip             String    @unique
+  failedAttempts Int       @default(0)
+  blockedUntil   DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@map("auth_ip_throttle")
+}
