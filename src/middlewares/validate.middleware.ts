@@ -1,5 +1,5 @@
 import { NextFunction, Request, Response } from 'express';
-import { ZodSchema } from 'zod';
+import { ZodType } from 'zod';
 import { BadRequestError } from '../utils/errors';
 
 type RequestTarget = 'body' | 'query' | 'params';
@@ -12,20 +12,20 @@ declare global {
   }
 }
 
-export function validate(schema: ZodSchema, target: RequestTarget = 'body') {
+export function validate(schema: ZodType, target: RequestTarget = 'body') {
   return (req: Request, _res: Response, next: NextFunction): void => {
-    const result = schema.safeParse(req[target]);
+    const result = schema.safeParse(req[target] ?? {});
 
     if (!result.success) {
-      const errors = result.error.flatten().fieldErrors;
-      const message = Object.entries(errors)
-        .map(([field, msgs]) => `${field}: ${Array.isArray(msgs) ? msgs.join(', ') : String(msgs)}`)
+      const message = result.error.issues
+        .map((issue) => (issue.path.length ? `${issue.path.join('.')}: ${issue.message}` : issue.message))
         .join('; ');
-      next(new BadRequestError(message));
+      next(new BadRequestError(message, 'VALIDATION_ERROR'));
       return;
     }
 
     if (target === 'query') {
+      // En Express 5 req.query es de sólo lectura.
       req.validatedQuery = result.data as Record<string, unknown>;
     } else {
       req[target] = result.data;

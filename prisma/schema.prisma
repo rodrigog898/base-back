@@ -23,28 +23,40 @@ model User {
   loginBlockedUntil   DateTime?
   bannedUntil         DateTime? @map("banned_until")
   lastConnectionAt    DateTime?
+  passwordChangedAt   DateTime?
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
 }
 
+/// Sesión de refresh token. Sólo se guarda el hash SHA-256 del token.
 model Session {
-  id           String   @id @default(auto()) @map("_id") @db.ObjectId
-  userId       String   @db.ObjectId
-  refreshToken String   @unique
+  id           String    @id @default(auto()) @map("_id") @db.ObjectId
+  userId       String    @db.ObjectId
+  refreshToken String    @unique
   expiresAt    DateTime
-  createdAt    DateTime @default(now())
+  ip           String?
+  userAgent    String?
+  lastUsedAt   DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([userId])
 }
 
+/// Registro de auditoría de seguridad (append-only, A.8.15).
 model AuthSecurityLog {
   id          String   @id @default(auto()) @map("_id") @db.ObjectId
   email       String
   event       String
+  outcome     String?
   description String
   userId      String?  @db.ObjectId
   ip          String?
   userAgent   String?
+  requestId   String?
   createdAt   DateTime @default(now())
 
+  @@index([email, createdAt])
+  @@index([userId, createdAt])
   @@map("auth_security_log")
 }
 

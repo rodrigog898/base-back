@@ -1,66 +1,64 @@
-import { NextFunction, Request, Response } from 'express';
-import { UnauthorizedError } from '../utils/errors';
+import { Request, Response } from 'express';
 import { AuthService } from '../services/auth.service';
+import { UnauthorizedError } from '../utils/errors';
+import { clearRefreshCookie, readRefreshCookie, setRefreshCookie } from '../utils/cookies';
+import { requestMeta } from '../utils/network';
+import { setContextUser } from '../context/requestContext';
+import { AuthResult } from '../types';
 
+/** Express 5 propaga automáticamente los errores de handlers async al error handler. */
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
-  register = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  private respond(res: Response, status: number, result: AuthResult): void {
+    setContextUser(result.user.id);
+    setRefreshCookie(res, result.refreshToken);
+    res.status(status).json({
+      success: true,
+      data: {
+        user: result.user,
+        accessToken: result.accessToken,
+        expiresIn: result.accessTokenExpiresIn,
+      },
+    });
+  }
+
+  register = async (req: Request, res: Response): Promise<void> => {
+    this.respond(res, 201, await this.authService.register(req.body, requestMeta(req)));
+  };
+
+  login = async (req: Request, res: Response): Promise<void> => {
+    this.respond(res, 200, await this.authService.login(req.body, requestMeta(req)));
+  };
+
+  refresh = async (req: Request, res: Response): Promise<void> => {
     try {
-      const result = await this.authService.register(req.body);
-      res.status(201).json({
-        success: true,
-        data: result,
-      });
-    } catch (error) {
-      next(error);
+      this.respond(res, 200, await this.authService.refresh(readRefreshCookie(req), requestMeta(req)));
+    } catch (err) {
+      clearRefreshCookie(res);
+      throw err;
     }
   };
 
-  login = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    try {
-      const result = await this.authService.login(req.body, {
-        ip: req.ip,
-        userAgent: req.get('user-agent') ?? undefined,
-      });
-      res.status(200).json({
-        success: true,
-        data: result,
-      });
-    } catch (error) {
-      next(error);
-    }
+  logout = async (req: Request, res: Response): Promise<void> => {
+    await this.authService.logout(readRefreshCookie(req), requestMeta(req));
+    clearRefreshCookie(res);
+    res.status(204).end();
   };
 
-  refresh = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    try {
-      const tokens = await this.authService.refresh(req.body.refreshToken);
-      res.status(200).json({
-        success: true,
-        data: tokens,
-      });
-    } catch (error) {
-      next(error);
-    }
+  logoutAll = async (req: Request, res: Response): Promise<void> => {
+    if (!req.user) throw new UnauthorizedError('Autenticación requerida');
+    await this.authService.logoutAll(req.user.sub, requestMeta(req));
+    clearRefreshCookie(res);
+    res.status(204).end();
   };
 
-  me = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    try {
-      if (!req.user) {
-        throw new UnauthorizedError('Autenticación requerida');
-      }
-
-      const user = await this.authService.getCurrentUser(req.user.sub);
-      res.status(200).json({
-        success: true,
-        data: {
-          id: user.id,
-          email: user.email,
-          role: user.role,
-        },
-      });
-    } catch (error) {
-      next(error);
-    }
+  me = async (req: Request, res: Response): Promise<void> => {
+    if (!req.user) throw new UnauthorizedError('Autenticación requerida');
+    const user = await this.authService.getCurrentUser(req.user.sub);
+    res.status(200).json({
+      success: true,
+      data: { id: user.id, email: user.email, role: user.role, lastConnectionAt: user.lastConnectionAt },
+    });
   };
 }

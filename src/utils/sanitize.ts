@@ -1,38 +1,50 @@
 import { NextFunction, Request, Response } from 'express';
+import { logger } from '../config/logger';
+import { BadRequestError } from './errors';
 
-const PROHIBITED_KEY_PATTERN = /^\$|\./;
+/**
+ * Protección contra NoSQL injection y prototype pollution (A.8.28).
+ * En lugar de reescribir claves silenciosamente, la request se rechaza:
+ * un cliente legítimo nunca envía claves "$..." , con "." o "__proto__".
+ */
+const OPERATOR_KEY = /^\$|\./;
+const POLLUTION_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+const MAX_DEPTH = 10;
 
-function sanitizeValue(value: unknown): unknown {
+export function findUnsafeKey(value: unknown, depth = 0): string | null {
+  if (depth > MAX_DEPTH) return '<max-depth>';
   if (Array.isArray(value)) {
-    return value.map(sanitizeValue);
-  }
-
-  if (value !== null && typeof value === 'object') {
-    return sanitizeObject(value as Record<string, unknown>);
-  }
-
-  return value;
-}
-
-function sanitizeObject(obj: Record<string, unknown>): Record<string, unknown> {
-  for (const key of Object.keys(obj)) {
-    if (PROHIBITED_KEY_PATTERN.test(key)) {
-      const safeKey = key.replace(/^\$/, '_').replace(/\./g, '_');
-      obj[safeKey] = sanitizeValue(obj[key]);
-      delete obj[key];
-      continue;
+    for (const item of value) {
+      const found = findUnsafeKey(item, depth + 1);
+      if (found) return found;
     }
-
-    obj[key] = sanitizeValue(obj[key]);
+    return null;
   }
-
-  return obj;
+  if (value !== null && typeof value === 'object') {
+    for (const key of Object.keys(value)) {
+      if (OPERATOR_KEY.test(key) || POLLUTION_KEYS.has(key)) return key;
+      const found = findUnsafeKey((value as Record<string, unknown>)[key], depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
 }
 
-export function sanitizeInputs(req: Request, _res: Response, next: NextFunction): void {
-  if (req.body && typeof req.body === 'object') {
-    sanitizeObject(req.body as Record<string, unknown>);
+export function rejectUnsafeInput(req: Request, _res: Response, next: NextFunction): void {
+  for (const [target, value] of [
+    ['body', req.body],
+    ['query', req.query],
+    ['params', req.params],
+  ] as const) {
+    const key = findUnsafeKey(value);
+    if (key) {
+      logger.warn(
+        { event: { category: 'web', action: 'unsafe-input-rejected', outcome: 'failure' }, target, key: key.slice(0, 64) },
+        'Unsafe input rejected'
+      );
+      next(new BadRequestError('La solicitud contiene parámetros no permitidos', 'UNSAFE_INPUT'));
+      return;
+    }
   }
-
   next();
 }

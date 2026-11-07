@@ -1,46 +1,74 @@
 {
   "name": "base-negocio-back",
-  "version": "1.0.0",
-  "description": "Backend base con Express, TypeScript, Prisma y MongoDB",
+  "version": "2.0.0",
+  "description": "Backend base con Express 5, TypeScript, Prisma y MongoDB. Logs JSON estructurados y controles alineados a ISO/IEC 27001:2022.",
   "main": "dist/server.js",
+  "private": true,
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
-    "dev": "nodemon --exec ts-node src/server.ts",
-    "build": "tsc",
+    "dev": "tsx watch src/server.ts",
+    "dev:pretty": "tsx watch src/server.ts | pino-pretty --messageKey message --timestampKey timestamp",
+    "build": "tsc -p tsconfig.build.json",
     "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "audit:deps": "npm audit --omit=dev --audit-level=high",
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push",
     "prisma:studio": "prisma studio",
-    "seed": "ts-node prisma/seed.ts",
+    "seed": "tsx prisma/seed.ts",
     "setup": "npm run prisma:generate && npm run prisma:push && npm run seed"
   },
-  "keywords": ["express", "typescript", "prisma", "mongodb", "jwt"],
-  "license": "ISC",
+  "keywords": [
+    "express",
+    "typescript",
+    "prisma",
+    "mongodb",
+    "jwt",
+    "iso27001"
+  ],
+  "license": "UNLICENSED",
   "dependencies": {
     "@prisma/client": "^6.19.3",
     "bcrypt": "^6.0.0",
     "compression": "^1.8.1",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
-    "express": "^5.2.1",
-    "express-rate-limit": "^8.5.2",
-    "helmet": "^8.2.0",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.3",
+    "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
-    "morgan": "^1.11.0",
-    "winston": "^3.19.0",
-    "winston-daily-rotate-file": "^5.0.0",
-    "zod": "^4.4.3"
+    "pino": "^10.4.0",
+    "pino-http": "^11.0.0",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/bcrypt": "^6.0.0",
     "@types/compression": "^1.8.1",
+    "@types/cookie-parser": "^1.4.10",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
-    "@types/morgan": "^1.9.10",
-    "@types/node": "^25.9.3",
-    "nodemon": "^3.1.14",
+    "@types/node": "^22.19.0",
+    "@types/supertest": "^7.2.1",
+    "eslint": "^10.14.0",
+    "eslint-plugin-security": "^4.2.1",
+    "pino-pretty": "^13.2.0",
     "prisma": "^6.19.3",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "supertest": "^7.3.1",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.72.1",
+    "vitest": "^5.1.0"
+  },
+  "overrides": {
+    "deepmerge-ts": "^8.0.2",
+    "minimatch": "^11.0.5"
   }
 }

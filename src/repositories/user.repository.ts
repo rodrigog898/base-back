@@ -1,5 +1,10 @@
 import { Prisma, PrismaClient, Role, User } from '@prisma/client';
 
+/**
+ * Las escrituras usan $runCommandRaw para funcionar con MongoDB standalone
+ * (Prisma exige replica set para create/update con transacciones implícitas).
+ */
+
 export class UserRepository {
   constructor(private readonly prisma: PrismaClient) {}
 
@@ -29,6 +34,7 @@ export class UserRepository {
           loginBlockedUntil: null,
           banned_until: null,
           lastConnectionAt: null,
+          passwordChangedAt: { $date: new Date().toISOString() },
           createdAt: { $date: new Date().toISOString() },
           updatedAt: { $date: new Date().toISOString() },
         },
@@ -80,6 +86,10 @@ export class UserRepository {
     if (typeof data.isActive === 'boolean') payload.isActive = data.isActive;
     if (typeof data.isBlocked === 'boolean') payload.isBlocked = data.isBlocked;
     if (typeof data.failedLoginAttempts === 'number') payload.failedLoginAttempts = data.failedLoginAttempts;
+
+    if (data.passwordChangedAt instanceof Date) {
+      payload.passwordChangedAt = { $date: data.passwordChangedAt.toISOString() };
+    }
 
     if (data.lastConnectionAt instanceof Date) {
       payload.lastConnectionAt = { $date: data.lastConnectionAt.toISOString() };

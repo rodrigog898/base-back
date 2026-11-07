@@ -1,31 +1,42 @@
-import rateLimit from 'express-rate-limit';
+import rateLimit, { Options } from 'express-rate-limit';
 import type { Request } from 'express';
 import { env } from '../config/env';
-import { isLocalhostIp, resolveClientIp } from '../utils/clientIp';
+import { auditLogger } from '../config/logger';
+import { clientIp, isLocalhostIp } from '../utils/network';
 
-const shouldSkipRateLimit = (req: Request): boolean =>
-  env.RATE_LIMIT_SKIP_LOCALHOST && isLocalhostIp(resolveClientIp(req));
+const shouldSkip = (req: Request): boolean => env.RATE_LIMIT_SKIP_LOCALHOST && isLocalhostIp(clientIp(req));
 
-export const globalRateLimiter = rateLimit({
-  windowMs: env.RATE_LIMIT_WINDOW_MS,
-  max: env.RATE_LIMIT_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: shouldSkipRateLimit,
-  message: {
-    success: false,
-    message: 'Demasiadas solicitudes, inténtalo más tarde',
-  },
-});
+function limiter(name: string, windowMs: number, limit: number, message: string) {
+  const handler: Options['handler'] = (req, res, _next, options) => {
+    auditLogger.warn(
+      { event: { category: 'network', action: 'rate-limit-exceeded', outcome: 'failure' }, limiter: name, ip: clientIp(req) },
+      'Rate limit exceeded'
+    );
+    res.status(options.statusCode).json({ success: false, code: 'TOO_MANY_REQUESTS', message });
+  };
 
-export const authRateLimiter = rateLimit({
-  windowMs: env.AUTH_RATE_LIMIT_WINDOW_MS,
-  max: env.AUTH_RATE_LIMIT_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: shouldSkipRateLimit,
-  message: {
-    success: false,
-    message: 'Demasiados intentos de autenticación, inténtalo más tarde',
-  },
-});
+  return rateLimit({
+    windowMs,
+    limit,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    skip: shouldSkip,
+    handler,
+  });
+}
+
+export const globalRateLimiter = limiter(
+  'global',
+  env.RATE_LIMIT_WINDOW_MS,
+  env.RATE_LIMIT_MAX,
+  'Demasiadas solicitudes, inténtalo más tarde'
+);
+
+export const authRateLimiter = limiter(
+  'auth',
+  env.AUTH_RATE_LIMIT_WINDOW_MS,
+  env.AUTH_RATE_LIMIT_MAX,
+  'Demasiados intentos de autenticación, inténtalo más tarde'
+);
+
+export const clientLogsRateLimiter = limiter('client-logs', 60_000, 30, 'Demasiados reportes, inténtalo más tarde');

@@ -1,71 +1,61 @@
-import { NextFunction, Request, Response } from 'express';
-import { verifyAccessToken } from '../utils/tokens';
-import { UnauthorizedError, ForbiddenError } from '../utils/errors';
+import { NextFunction, Request, RequestHandler, Response } from 'express';
 import { Role } from '@prisma/client';
-import { prisma } from '../config/prisma';
+import { verifyAccessToken } from '../utils/tokens';
+import { ForbiddenError, UnauthorizedError } from '../utils/errors';
+import { UserRepository } from '../repositories/user.repository';
+import { setContextUser } from '../context/requestContext';
+import { auditLogger } from '../config/logger';
+import { clientIp } from '../utils/network';
+import { AuthenticatedUser } from '../types';
+import { isUserAccessAllowed } from '../services/auth.service';
 
 declare global {
   namespace Express {
     interface Request {
-      user?: {
-        sub: string;
-        email: string;
-        role: Role;
-      };
+      user?: AuthenticatedUser;
     }
   }
 }
 
-export async function authenticate(req: Request, _res: Response, next: NextFunction): Promise<void> {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader?.startsWith('Bearer ')) {
-    next(new UnauthorizedError('Token de acceso requerido'));
-    return;
-  }
-
-  const token = authHeader.split(' ')[1];
-
-  try {
-    const payload = verifyAccessToken(token);
-    const user = await prisma.user.findUnique({
-      where: { id: payload.sub },
-      select: {
-        id: true,
-        isActive: true,
-        isBlocked: true,
-        bannedUntil: true,
-      },
-    });
-
-    if (!user) {
-      next(new UnauthorizedError('Token de acceso inválido o expirado'));
+/**
+ * Autenticación por Bearer token (A.8.5).
+ * El estado del usuario se verifica en cada request para que un bloqueo o
+ * desactivación tenga efecto inmediato aunque el access token siga vigente.
+ */
+export function createAuthenticate(userRepository: UserRepository): RequestHandler {
+  return async (req: Request, _res: Response, next: NextFunction): Promise<void> => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ')) {
+      next(new UnauthorizedError('Token de acceso requerido', 'TOKEN_REQUIRED'));
       return;
     }
 
-    if (user.isActive === false) {
-      next(new ForbiddenError('Este usuario está desactivado'));
+    let payload;
+    try {
+      payload = verifyAccessToken(authHeader.slice(7).trim());
+    } catch {
+      next(new UnauthorizedError('Token de acceso inválido o expirado', 'INVALID_TOKEN'));
       return;
     }
 
-    if (user.isBlocked === true) {
-      next(new ForbiddenError('Acceso denegado'));
-      return;
-    }
+    try {
+      const user = await userRepository.findById(payload.sub);
+      if (!user || !isUserAccessAllowed(user)) {
+        next(new UnauthorizedError('Token de acceso inválido o expirado', 'INVALID_TOKEN'));
+        return;
+      }
 
-    if (user.bannedUntil && user.bannedUntil > new Date()) {
-      next(new ForbiddenError('Acceso denegado'));
-      return;
+      // El rol se toma de la base de datos, no del token (evita privilegios obsoletos).
+      req.user = { sub: user.id, role: user.role };
+      setContextUser(user.id);
+      next();
+    } catch (err) {
+      next(err);
     }
-
-    req.user = payload;
-    next();
-  } catch {
-    next(new UnauthorizedError('Token de acceso inválido o expirado'));
-  }
+  };
 }
 
-export function authorize(...roles: Role[]) {
+export function authorize(...roles: Role[]): RequestHandler {
   return (req: Request, _res: Response, next: NextFunction): void => {
     if (!req.user) {
       next(new UnauthorizedError('Autenticación requerida'));
@@ -73,7 +63,17 @@ export function authorize(...roles: Role[]) {
     }
 
     if (!roles.includes(req.user.role)) {
-      next(new ForbiddenError('Permisos insuficientes'));
+      auditLogger.warn(
+        {
+          event: { category: 'iam', action: 'authorization-denied', outcome: 'failure' },
+          requiredRoles: roles,
+          role: req.user.role,
+          path: req.originalUrl.split('?')[0],
+          ip: clientIp(req),
+        },
+        'Authorization denied'
+      );
+      next(new ForbiddenError('Permisos insuficientes', 'INSUFFICIENT_PERMISSIONS'));
       return;
     }
 

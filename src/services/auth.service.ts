@@ -1,8 +1,10 @@
-import { Role } from '@prisma/client';
+import { Role, User } from '@prisma/client';
 import { UserRepository } from '../repositories/user.repository';
 import { SessionRepository } from '../repositories/session.repository';
-import { comparePassword, hashPassword } from '../utils/bcrypt';
+import { AuthIpThrottleRepository } from '../repositories/authIpThrottle.repository';
+import { comparePassword, hashPassword, verifyDummyPassword } from '../utils/bcrypt';
 import {
+  durationToMs,
   getRefreshTokenExpiry,
   hashRefreshToken,
   signAccessToken,
@@ -10,287 +12,307 @@ import {
   verifyRefreshToken,
 } from '../utils/tokens';
 import { toSafeUser } from '../utils/userMapper';
-import { ConflictError, ForbiddenError, UnauthorizedError, NotFoundError } from '../utils/errors';
-import { SafeUser, TokenPair } from '../types';
+import { ConflictError, ForbiddenError, NotFoundError, TooManyRequestsError, UnauthorizedError } from '../utils/errors';
+import { AuthResult, RequestMeta, SafeUser } from '../types';
 import { LoginInput, RegisterInput } from '../schemas';
-import { logger } from '../config/logger';
-import { AuthSecurityLogRepository } from '../repositories/authSecurityLog.repository';
-import { AuthIpThrottleRepository } from '../repositories/authIpThrottle.repository';
+import { env } from '../config/env';
+import { isLocalhostIp } from '../utils/network';
+import { AuditService } from './audit.service';
 
-const MAX_FAILED_LOGIN_ATTEMPTS = 5;
-const MAX_FAILED_IP_ATTEMPTS = 5;
-const BRUTE_FORCE_BLOCK_MINUTES = 10;
+const INVALID_CREDENTIALS = 'Credenciales inválidas';
+const INVALID_REFRESH = 'Sesión inválida o expirada';
 
-type UserSecurityFields = {
-  isActive?: boolean;
-  isBlocked?: boolean;
-  loginBlockedUntil?: Date | null;
-  bannedUntil?: Date | null;
-  failedLoginAttempts?: number;
-};
+/** Usuario habilitado para operar: activo, no bloqueado y sin suspensión vigente. */
+export function isUserAccessAllowed(user: Pick<User, 'isActive' | 'isBlocked' | 'bannedUntil'>): boolean {
+  if (user.isActive === false || user.isBlocked === true) return false;
+  if (user.bannedUntil && user.bannedUntil > new Date()) return false;
+  return true;
+}
 
 export class AuthService {
   constructor(
     private readonly userRepository: UserRepository,
     private readonly sessionRepository: SessionRepository,
-    private readonly authSecurityLogRepository: AuthSecurityLogRepository,
-    private readonly authIpThrottleRepository: AuthIpThrottleRepository
+    private readonly ipThrottleRepository: AuthIpThrottleRepository,
+    private readonly audit: AuditService
   ) {}
 
-  async register(input: RegisterInput): Promise<{ user: SafeUser; tokens: TokenPair }> {
+  private get lockoutMessage(): string {
+    return `Demasiados intentos fallidos. Intenta nuevamente en ${env.AUTH_LOCKOUT_MINUTES} minutos.`;
+  }
+
+  async register(input: RegisterInput, meta: RequestMeta = {}): Promise<AuthResult> {
     const existing = await this.userRepository.findByEmail(input.email);
     if (existing) {
-      throw new ConflictError('El correo ya está registrado');
+      throw new ConflictError('El correo ya está registrado', 'EMAIL_ALREADY_REGISTERED');
     }
 
     const passwordHash = await hashPassword(input.password);
-    const user = await this.userRepository.create({
-      email: input.email,
-      passwordHash,
+    const user = await this.userRepository.create({ email: input.email, passwordHash });
+
+    await this.audit.record({
+      event: 'REGISTER',
+      outcome: 'success',
+      description: 'User registered',
+      email: user.email,
+      userId: user.id,
+      meta,
     });
 
-    const tokens = await this.createSession(user.id, user.email, user.role);
-    const connectedUser = await this.markUserConnected(user.id);
-
-    logger.info('User registered', { userId: user.id, email: user.email });
-
-    return { user: toSafeUser(connectedUser), tokens };
+    return this.issueSession(user, meta);
   }
 
-  async login(
-    input: LoginInput,
-    context?: { ip?: string; userAgent?: string }
-  ): Promise<{ user: SafeUser; tokens: TokenPair }> {
-    const normalizedIp = this.normalizeIp(context?.ip);
-    const shouldTrackIp = normalizedIp ? !this.isLocalhostIp(normalizedIp) : false;
-    const normalizedContext = {
-      ip: normalizedIp,
-      userAgent: context?.userAgent,
-    };
+  async login(input: LoginInput, meta: RequestMeta = {}): Promise<AuthResult> {
+    const trackIp = Boolean(meta.ip) && !isLocalhostIp(meta.ip);
 
-    if (normalizedIp && shouldTrackIp) {
-      const blockedUntil = await this.authIpThrottleRepository.getActiveBlock(normalizedIp);
+    // 1. Bloqueo por IP
+    if (trackIp && meta.ip) {
+      const blockedUntil = await this.ipThrottleRepository.getActiveBlock(meta.ip);
       if (blockedUntil) {
-        await this.authSecurityLogRepository.create({
-          email: input.email,
+        await this.audit.record({
           event: 'BLOCKED_IP_ATTEMPT',
-          description: `Blocked login attempt from throttled IP until ${blockedUntil.toISOString()}`,
-          ip: normalizedIp,
-          userAgent: context?.userAgent,
+          outcome: 'failure',
+          description: `Login attempt from throttled IP (blocked until ${blockedUntil.toISOString()})`,
+          email: input.email,
+          meta,
         });
-        throw new ForbiddenError('Demasiados intentos fallidos. Intenta nuevamente en 10 minutos.');
+        throw new TooManyRequestsError(this.lockoutMessage, 'IP_TEMPORARILY_BLOCKED');
       }
     }
 
+    // 2. Usuario inexistente: se ejecuta bcrypt igual para no filtrar existencia por tiempo de respuesta.
     const user = await this.userRepository.findByEmail(input.email);
     if (!user) {
-      const ipBlocked = shouldTrackIp
-        ? await this.handleFailedIpAttempt(input.email, normalizedContext)
-        : false;
-      if (ipBlocked) {
-        throw new ForbiddenError('Demasiados intentos fallidos. Intenta nuevamente en 10 minutos.');
-      }
-      throw new UnauthorizedError('Credenciales inválidas');
-    }
-    const securedUser = user as typeof user & UserSecurityFields;
-
-    if (securedUser.isActive === false) {
-      throw new ForbiddenError('Este usuario está desactivado');
+      await verifyDummyPassword(input.password);
+      await this.failIp(input.email, meta, trackIp);
+      throw new UnauthorizedError(INVALID_CREDENTIALS, 'INVALID_CREDENTIALS');
     }
 
-    if (securedUser.isBlocked === true) {
-      throw new ForbiddenError('Este usuario está bloqueado');
-    }
-
-    if (securedUser.bannedUntil && securedUser.bannedUntil > new Date()) {
-      throw new ForbiddenError('Este usuario está suspendido temporalmente');
-    }
-
-    if (securedUser.loginBlockedUntil && securedUser.loginBlockedUntil > new Date()) {
-      await this.authSecurityLogRepository.create({
+    // 3. Bloqueo temporal de la cuenta por fuerza bruta
+    if (user.loginBlockedUntil && user.loginBlockedUntil > new Date()) {
+      await this.audit.record({
+        event: 'BLOCKED_ATTEMPT',
+        outcome: 'failure',
+        description: 'Login attempt while temporary account lockout is active',
         email: user.email,
         userId: user.id,
-        event: 'BLOCKED_ATTEMPT',
-        description: 'Blocked login attempt while temporary restriction is active',
-        ip: normalizedContext.ip,
-        userAgent: normalizedContext.userAgent,
+        meta,
       });
-      throw new ForbiddenError('Demasiados intentos fallidos. Intenta nuevamente en 10 minutos.');
+      throw new TooManyRequestsError(this.lockoutMessage, 'ACCOUNT_TEMPORARILY_LOCKED');
     }
 
+    // 4. Contraseña (antes de revelar cualquier estado de la cuenta)
     const isValid = await comparePassword(input.password, user.passwordHash);
     if (!isValid) {
-      const isTemporarilyBlocked = await this.handleFailedLogin(
-        user.id,
-        user.email,
-        securedUser.failedLoginAttempts ?? 0,
-        normalizedContext
-      );
-      const ipBlocked = shouldTrackIp
-        ? await this.handleFailedIpAttempt(user.email, normalizedContext)
-        : false;
-      if (isTemporarilyBlocked || ipBlocked) {
-        throw new ForbiddenError('Demasiados intentos fallidos. Intenta nuevamente en 10 minutos.');
-      }
-      throw new UnauthorizedError('Credenciales inválidas');
+      const accountLocked = await this.failAccount(user, meta);
+      const ipLocked = await this.failIp(user.email, meta, trackIp);
+      if (accountLocked || ipLocked) throw new TooManyRequestsError(this.lockoutMessage, 'ACCOUNT_TEMPORARILY_LOCKED');
+      throw new UnauthorizedError(INVALID_CREDENTIALS, 'INVALID_CREDENTIALS');
     }
 
-    await this.resetFailedLoginState(user.id);
-    if (normalizedIp && shouldTrackIp) {
-      await this.authIpThrottleRepository.resetByIp(normalizedIp);
+    // 5. Estado de la cuenta (sólo tras credenciales correctas, mensaje genérico)
+    if (!isUserAccessAllowed(user)) {
+      await this.audit.record({
+        event: 'ACCOUNT_DISABLED_ATTEMPT',
+        outcome: 'failure',
+        description: 'Valid credentials for inactive, blocked or suspended account',
+        email: user.email,
+        userId: user.id,
+        meta,
+      });
+      throw new ForbiddenError('La cuenta no está habilitada. Contacta al administrador.', 'ACCOUNT_DISABLED');
     }
-    const tokens = await this.createSession(user.id, user.email, user.role);
-    const connectedUser = await this.markUserConnected(user.id);
 
-    logger.info('User logged in', { userId: user.id });
+    await this.userRepository.update(user.id, { failedLoginAttempts: 0, loginBlockedUntil: null });
+    if (trackIp && meta.ip) await this.ipThrottleRepository.resetByIp(meta.ip);
 
-    return { user: toSafeUser(connectedUser), tokens };
+    await this.audit.record({
+      event: 'LOGIN_SUCCESS',
+      outcome: 'success',
+      description: 'User logged in',
+      email: user.email,
+      userId: user.id,
+      meta,
+    });
+
+    return this.issueSession(user, meta);
   }
 
-  async getCurrentUser(userId: string): Promise<SafeUser> {
-    const user = await this.userRepository.findById(userId);
-    if (!user) {
-      throw new NotFoundError('Usuario no encontrado');
-    }
+  /**
+   * Rotación de refresh token con detección de reutilización (OWASP ASVS 3.5 / RFC 9700):
+   * si llega un refresh token con firma válida pero cuya sesión ya no existe,
+   * se asume robo y se revocan todas las sesiones del usuario.
+   */
+  async refresh(refreshToken: string | undefined, meta: RequestMeta = {}): Promise<AuthResult> {
+    if (!refreshToken) throw new UnauthorizedError(INVALID_REFRESH, 'REFRESH_TOKEN_REQUIRED');
 
-    const securedUser = user as typeof user & UserSecurityFields;
-    if (securedUser.isActive === false || securedUser.isBlocked === true) {
-      throw new UnauthorizedError('El usuario no tiene permitido iniciar sesión');
-    }
-
-    if (securedUser.bannedUntil && securedUser.bannedUntil > new Date()) {
-      throw new UnauthorizedError('El usuario no tiene permitido iniciar sesión');
-    }
-
-    return toSafeUser(user);
-  }
-
-  async refresh(refreshToken: string): Promise<TokenPair> {
     let payload;
     try {
       payload = verifyRefreshToken(refreshToken);
     } catch {
-      throw new UnauthorizedError('Token de actualización inválido o expirado');
+      throw new UnauthorizedError(INVALID_REFRESH, 'INVALID_REFRESH_TOKEN');
     }
 
-    const refreshTokenHash = hashRefreshToken(refreshToken);
-    const session = await this.sessionRepository.findByRefreshTokenHash(refreshTokenHash);
-    if (!session || session.expiresAt < new Date()) {
-      throw new UnauthorizedError('Token de actualización inválido o expirado');
-    }
-
+    const hash = hashRefreshToken(refreshToken);
+    const session = await this.sessionRepository.findByRefreshTokenHash(hash);
     const user = await this.userRepository.findById(payload.sub);
-    if (!user) {
-      throw new UnauthorizedError('Usuario no encontrado');
+
+    if (!session) {
+      if (user) {
+        const revoked = await this.sessionRepository.deleteByUserId(user.id);
+        await this.audit.record({
+          event: 'TOKEN_REUSE_DETECTED',
+          outcome: 'failure',
+          description: `Refresh token reuse detected; ${revoked} session(s) revoked`,
+          email: user.email,
+          userId: user.id,
+          meta,
+        });
+      }
+      throw new UnauthorizedError(INVALID_REFRESH, 'INVALID_REFRESH_TOKEN');
     }
-    const securedUser = user as typeof user & UserSecurityFields;
 
-    if (securedUser.isActive === false || securedUser.isBlocked === true) {
-      throw new UnauthorizedError('El usuario no tiene permitido iniciar sesión');
+    // Consumir la sesión de forma atómica: si dos requests compiten, sólo una gana.
+    const consumed = await this.sessionRepository.deleteByRefreshTokenHash(hash);
+    if (!consumed || session.expiresAt < new Date() || session.userId !== payload.sub) {
+      throw new UnauthorizedError(INVALID_REFRESH, 'INVALID_REFRESH_TOKEN');
     }
 
-    if (securedUser.bannedUntil && securedUser.bannedUntil > new Date()) {
-      throw new UnauthorizedError('El usuario no tiene permitido iniciar sesión');
+    if (!user || !isUserAccessAllowed(user)) {
+      throw new UnauthorizedError(INVALID_REFRESH, 'INVALID_REFRESH_TOKEN');
     }
 
-    await this.sessionRepository.deleteByRefreshTokenHash(refreshTokenHash);
+    await this.audit.record({
+      event: 'TOKEN_REFRESH',
+      outcome: 'success',
+      description: 'Refresh token rotated',
+      email: user.email,
+      userId: user.id,
+      meta,
+    });
 
-    const tokens = await this.createSession(user.id, user.email, user.role);
-    await this.markUserConnected(user.id);
-    return tokens;
+    return this.issueSession(user, meta, { markConnected: false });
   }
 
-  private async createSession(userId: string, email: string, role: Role): Promise<TokenPair> {
-    const payload = { sub: userId, email, role };
-    const accessToken = signAccessToken(payload);
-    const refreshToken = signRefreshToken(payload);
-    const refreshTokenHash = hashRefreshToken(refreshToken);
-    const expiresAt = getRefreshTokenExpiry();
+  async logout(refreshToken: string | undefined, meta: RequestMeta = {}): Promise<void> {
+    if (!refreshToken) return;
 
-    await this.sessionRepository.create({ userId, refreshTokenHash, expiresAt });
+    const hash = hashRefreshToken(refreshToken);
+    const session = await this.sessionRepository.findByRefreshTokenHash(hash);
+    if (!session) return;
 
-    return { accessToken, refreshToken };
-  }
-
-  private async markUserConnected(userId: string) {
-    return this.userRepository.update(userId, { lastConnectionAt: new Date() });
-  }
-
-  private async resetFailedLoginState(userId: string): Promise<void> {
-    await this.userRepository.update(userId, {
-      failedLoginAttempts: 0,
-      loginBlockedUntil: null,
+    await this.sessionRepository.deleteByRefreshTokenHash(hash);
+    const user = await this.userRepository.findById(session.userId);
+    await this.audit.record({
+      event: 'LOGOUT',
+      outcome: 'success',
+      description: 'Session closed',
+      email: user?.email ?? 'unknown',
+      userId: session.userId,
+      meta,
     });
   }
 
-  private async handleFailedLogin(
-    userId: string,
-    email: string,
-    currentAttempts: number,
-    context?: { ip?: string; userAgent?: string }
-  ): Promise<boolean> {
-    const nextAttempts = currentAttempts + 1;
+  async logoutAll(userId: string, meta: RequestMeta = {}): Promise<number> {
+    const user = await this.userRepository.findById(userId);
+    const revoked = await this.sessionRepository.deleteByUserId(userId);
+    await this.audit.record({
+      event: 'LOGOUT_ALL',
+      outcome: 'success',
+      description: `All sessions revoked (${revoked})`,
+      email: user?.email ?? 'unknown',
+      userId,
+      meta,
+    });
+    return revoked;
+  }
 
-    if (nextAttempts >= MAX_FAILED_LOGIN_ATTEMPTS) {
-      const blockedUntil = new Date(Date.now() + BRUTE_FORCE_BLOCK_MINUTES * 60 * 1000);
-      await this.userRepository.update(userId, {
+  async getCurrentUser(userId: string): Promise<SafeUser> {
+    const user = await this.userRepository.findById(userId);
+    if (!user) throw new NotFoundError('Usuario no encontrado');
+    if (!isUserAccessAllowed(user)) throw new UnauthorizedError('Sesión inválida', 'ACCOUNT_DISABLED');
+    return toSafeUser(user);
+  }
+
+  private async issueSession(
+    user: User,
+    meta: RequestMeta,
+    options: { markConnected?: boolean } = {}
+  ): Promise<AuthResult> {
+    const accessToken = signAccessToken({ sub: user.id, role: user.role as Role });
+    const refreshToken = signRefreshToken(user.id);
+
+    await this.sessionRepository.deleteExpiredForUser(user.id);
+    await this.sessionRepository.create({
+      userId: user.id,
+      refreshTokenHash: hashRefreshToken(refreshToken),
+      expiresAt: getRefreshTokenExpiry(),
+      ip: meta.ip,
+      userAgent: meta.userAgent,
+    });
+
+    const current =
+      options.markConnected === false ? user : await this.userRepository.update(user.id, { lastConnectionAt: new Date() });
+
+    return {
+      user: toSafeUser(current),
+      accessToken,
+      accessTokenExpiresIn: Math.floor(durationToMs(env.JWT_ACCESS_EXPIRES_IN) / 1000),
+      refreshToken,
+    };
+  }
+
+  /** @returns true si la cuenta quedó bloqueada temporalmente */
+  private async failAccount(user: User, meta: RequestMeta): Promise<boolean> {
+    const attempts = (user.failedLoginAttempts ?? 0) + 1;
+
+    if (attempts >= env.AUTH_MAX_FAILED_ATTEMPTS) {
+      await this.userRepository.update(user.id, {
         failedLoginAttempts: 0,
-        loginBlockedUntil: blockedUntil,
+        loginBlockedUntil: new Date(Date.now() + env.AUTH_LOCKOUT_MINUTES * 60_000),
       });
-
-      await this.authSecurityLogRepository.create({
-        email,
-        userId,
+      await this.audit.record({
         event: 'TEMP_BLOCKED',
-        description: `Temporary account restriction for ${BRUTE_FORCE_BLOCK_MINUTES} minutes after repeated failed login attempts`,
-        ip: context?.ip,
-        userAgent: context?.userAgent,
+        outcome: 'failure',
+        description: `Account locked for ${env.AUTH_LOCKOUT_MINUTES} minutes after ${attempts} failed attempts`,
+        email: user.email,
+        userId: user.id,
+        meta,
       });
-
       return true;
     }
 
-    await this.userRepository.update(userId, { failedLoginAttempts: nextAttempts });
-    await this.authSecurityLogRepository.create({
-      email,
-      userId,
+    await this.userRepository.update(user.id, { failedLoginAttempts: attempts });
+    await this.audit.record({
       event: 'FAILED_LOGIN',
-      description: `Failed login attempt #${nextAttempts}`,
-      ip: context?.ip,
-      userAgent: context?.userAgent,
+      outcome: 'failure',
+      description: `Failed login attempt #${attempts}`,
+      email: user.email,
+      userId: user.id,
+      meta,
     });
     return false;
   }
 
-  private async handleFailedIpAttempt(email: string, context?: { ip?: string; userAgent?: string }): Promise<boolean> {
-    if (!context?.ip) return false;
+  /** @returns true si la IP quedó bloqueada temporalmente */
+  private async failIp(email: string, meta: RequestMeta, trackIp: boolean): Promise<boolean> {
+    if (!trackIp || !meta.ip) return false;
 
-    const isBlocked = await this.authIpThrottleRepository.registerFailedAttempt(
-      context.ip,
-      MAX_FAILED_IP_ATTEMPTS,
-      BRUTE_FORCE_BLOCK_MINUTES
+    const blocked = await this.ipThrottleRepository.registerFailedAttempt(
+      meta.ip,
+      env.AUTH_MAX_FAILED_ATTEMPTS,
+      env.AUTH_LOCKOUT_MINUTES
     );
 
-    await this.authSecurityLogRepository.create({
+    await this.audit.record({
+      event: blocked ? 'TEMP_BLOCKED_IP' : 'FAILED_LOGIN_IP',
+      outcome: 'failure',
+      description: blocked
+        ? `IP locked for ${env.AUTH_LOCKOUT_MINUTES} minutes after repeated failed attempts`
+        : 'Failed login attempt tracked by IP',
       email,
-      event: isBlocked ? 'TEMP_BLOCKED_IP' : 'FAILED_LOGIN_IP',
-      description: isBlocked
-        ? `IP restricted for ${BRUTE_FORCE_BLOCK_MINUTES} minutes due to repeated failed login attempts`
-        : 'Failed login attempt tracked by IP throttling',
-      ip: context.ip,
-      userAgent: context.userAgent,
+      meta,
     });
-
-    return isBlocked;
-  }
-
-  private normalizeIp(ip?: string): string | undefined {
-    const value = ip?.trim();
-    if (!value) return undefined;
-    return value;
-  }
-
-  private isLocalhostIp(ip: string): boolean {
-    return ip === '::1' || ip === '127.0.0.1' || ip === '::ffff:127.0.0.1' || ip === 'localhost';
+    return blocked;
   }
 }
